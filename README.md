@@ -6,4 +6,16 @@ Un **thread** è un'unità di esecuzione che può essere gestita in parallelo al
 
 ### Funzioni principali:
 - **`thread`**: Classe che rappresenta un thread di esecuzione.
+  ```cpp
+  #include <iostream>
+  #include <thread>
+
+  using namespace std;
+
+  void function() { ... }
+  
+  int main() {
+      thread t1(function);
+  }
+- **`
 
