@@ -6,134 +6,144 @@
 #include <ctime>
 #include <vector>
 #include <chrono>
+#include <future>
+#include <atomic>
 
 using namespace std;
 
-int N_TASK = 30; // Numero di task totali
-int N_WORKERS = 1; // Numero di worker che lavorano sulla coda
-mutex mut;
-mutex printmut;
+int N_TASK = 3;
+int N_WORKERS = 1;
+int MAX_TASK_TIME = 3;
 
+mutex memoryMutex, outputMutex; // Mutex per l'accesso ai dati e alla console
 
 // ----- GENERATORE NUMERI RANDOM ----- //
-int random() {
+int trandom() {
     static bool inizializzato = false;
     if (!inizializzato) {
         srand(time(nullptr));   // Inizializza il generatore SOLO la prima volta
         inizializzato = true;
     }
-    return (rand() % 4) + 1;     // Restituisce un numero tra 1 e 4
+    return (rand() % MAX_TASK_TIME) + 1;
 }
 
-
-// ----- CLASSE TASK ----- //
+// ----- CLASSE TASK ----- 
 class Task {
-public:
-    int id;
+    public:
+        int id;
+        int tempoEsecuzione = trandom();
 
-    // Costruttore che inizializza l'ID
-    Task(int id_) : id(id_) {}
+        Task(int i) : id(i){}
 };
 
-// ----- CLASSE WORKER ------ //
+// ----- CLASSE WORKER -----
 class Worker {
-// Puntatore alla coda condivisa
-private:
-    queue<Task>* taskQueue;
-    int id;
-    vector<thread> taskThreads;
-    
-public:
+    private: 
+        queue<Task>& codaTask;
+        int id;
+        thread workerThread;
+        atomic<bool>& stop;
+        vector<thread> taskThreads;
 
-    // Costruttore
-    Worker(queue<Task>* queue, int id_) : taskQueue(queue), id(id_) {}
-    
-
-    // Metodo per controllare se ci sono task nella coda
-    bool controllaTask() {
-        
-        mut.lock();
-
-        if(taskQueue->empty()) {
-            mut.unlock();
-            return false; // Ritorna false se non ci sono task nella coda per interrompere il ciclo nel main
+    public:
+        // Costruttore
+        Worker(queue<Task>& q, int id, atomic<bool>& stopFlag): codaTask(q), id(id), stop(stopFlag) {
+            workerThread = thread(&Worker::ElaboraTask, this);  // Avvio il thread del worker nel costruttore
         }
 
-        Task t = taskQueue->front(); // Prende la prima task dalla coda
-        taskQueue->pop();            // Toglie la prima Task dalla coda
-        mut.unlock();
-
-        elaboraTask(t);              // Elabora il task
-        return true;                 // Ritorna true se è stato trovato almeno un task
-    }
-    
-    // Metodo per elaborare il task
-    void elaboraTask(Task t) {
-
-        // Thread Lambda per simulare l'elaborazione del task
-        taskThreads.emplace_back([this, t](){
-            this_thread::sleep_for(chrono::seconds(random())); // Simula un tempo di elaborazione casuale
-            lock_guard<mutex> guard(printmut);
-            cout << "[WORKER "<< id << "] elaborato task ["<<t.id<<"]\n";
-        });                  
-    }
-
-    void joinAll() {
-        for(auto& t : taskThreads) {
-            if(t.joinable())
-                t.join();
+        // Distruttore (Joina il thread del worker)
+        ~Worker() {
+            if (workerThread.joinable()) {
+                workerThread.join();
+            }
         }
-    }
-    
+
+        // Metodo per elaborare i task
+        void ElaboraTask() {
+            while(true) {
+
+                Task task(0); // task di default
+
+                // Preleva la task dalla coda
+                {
+                    lock_guard<mutex> lock(memoryMutex);
+                    if (!codaTask.empty()) {
+                        task = codaTask.front();
+                        codaTask.pop();
+                    } else if(stop) {
+                        break;
+                    }
+                }
+
+
+                {
+                    lock_guard<mutex> lock(outputMutex);
+                    cout << "[WORKER #" << id << "] Ricevuta task con ID: " << task.id << ", Tempo di esecuzione: " << task.tempoEsecuzione << endl;
+                }
+
+                // Creazione dei threads per l'elaborazione dei task
+                taskThreads.push_back(thread([this, task]() {
+                    this_thread::sleep_for(chrono::seconds(task.tempoEsecuzione));
+                    lock_guard<mutex> lock(outputMutex);
+                    cout << "[WORKER #" << id << "] Terminata task con ID: " << task.id << endl;
+                }));
+            }
+
+            // Joina tutti i thread attivi che ha creato
+            for(auto& t : taskThreads) {
+                if(t.joinable())
+                    t.join();
+            }
+        }
 };
 
+// ----- CLASSE MASTER -----
 class Master {
-private:
-    queue<Task>* taskQueue;
-public:
-    vector<Worker*> workers;
-    Master(queue<Task>* q) : taskQueue(q) {}
+    private:
+        queue<Task> codaTask;
+        vector<unique_ptr<Worker>> workers;
+        atomic<bool> stopFlag{false};
+    public:
+        Master() {}
 
-    void generaTasks() {
-        for(int i = 0; i < N_TASK; i++) {
-            taskQueue->push(Task(i)); // Aggiungi task con ID i
+        void generaTasks() {
+            for(int i = 0; i < N_TASK; i++) {
+                lock_guard<mutex> lock(memoryMutex);
+                codaTask.emplace(i); // Creo la Task direttamente nella coda
+                cout << "[MASTER] Generato task con ID: " << i << ", Tempo di esecuzione: " << codaTask.back().tempoEsecuzione << endl;
+            }
         }
-    }
 
-    void generaWorkers() {
-        for(int i = 0; i < N_WORKERS; i++) {
-            workers.push_back(new Worker(taskQueue,i));
+        void generaWorkers() {
+            for(int i = 0; i < N_WORKERS; i++) {
+                workers.emplace_back(make_unique<Worker>(codaTask, i, stopFlag)); // Crea un nuovo worker e lo aggiunge al vettore
+            }
         }
-    }
+
+        void execute() {
+            generaTasks();
+            this_thread::sleep_for(chrono::seconds(3));
+            cout << "\n-------------------------------------------\n\n";
+            generaWorkers();
+
+            // Ciclo per verificare se ci sono task da elaborare, in caso contrario distruggi i workers
+            while(!stopFlag) {
+                lock_guard<mutex> lock(memoryMutex);
+                if(codaTask.empty()) {
+                    cout << "[MASTER] Tutte le tasks elaborate" << endl;
+                    stopFlag = true;
+                }
+                this_thread::sleep_for(chrono::seconds(1)); // Controlla ogni secondo per evitare busy waiting
+            }
+
+        }
 };
 
-// ----- MAIN ----- //
 int main() {
-    queue<Task> tasks;      // Coda condivisa
 
-    Master master(&tasks);  // Creazione dell'oggetto Master
+    Master master;
 
-    master.generaTasks();   // Genera i task
-    master.generaWorkers(); // Genera gli worker
-
-    // Avvia i thread degli worker
-    vector<thread> threads;
-    for(auto& w : master.workers){
-        threads.emplace_back([w]() {
-            while(w->controllaTask());
-        });
-    }
-
-    // Join di tutti i thread degli worker
-    for(auto& t : threads) {
-        if(t.joinable())
-            t.join();
-    }
-
-    // Join di tutti i thread di elaborazione dei task dei worker
-    for(auto& w : master.workers) {
-        w->joinAll();
-    }
+    master.execute();
 
     return 0;
 }
